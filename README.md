@@ -4,10 +4,10 @@
 Coeval and Ironside. It is deployment tooling, not part of either product's
 runtime or authorization model.
 
-Status: **pre-release**. Do not advertise the one-line command until both
-products have published releases containing `deploy/self-host/compose.yaml`,
-their GHCR packages allow anonymous pulls, and the clean-runner public
-installer smoke workflow has passed.
+Status: **supported initial release** for new single-host installations.
+Coeval v0.2.0 and Ironside v0.2.0 publish versioned self-host bundles, all five
+application images allow anonymous pulls, and the exact public installer
+command has passed the clean-runner smoke workflow.
 
 ## Support boundary
 
@@ -29,7 +29,7 @@ contracts, but `trustctl` does not take credentials for them.
 
 ## One-line bootstrap
 
-After the first compatible product releases are published, the entry point is:
+The public entry point is:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/luka-zivkovic/trustctl/main/install.sh \
