@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+TRUSTCTL_VERSION="0.1.0"
+DEFAULT_ROOT_NAME="ai-trust-stack"
+DEFAULT_RAW_BASE="https://raw.githubusercontent.com/luka-zivkovic"
+DEFAULT_API_BASE="https://api.github.com/repos/luka-zivkovic"
+
+info() {
+  printf '==> %s\n' "$*"
+}
+
+ok() {
+  printf '  ✓ %s\n' "$*"
+}
+
+warn() {
+  printf '  ! %s\n' "$*" >&2
+}
+
+die() {
+  printf 'trustctl: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+trustctl manages only the single-host Docker installations it creates.
+
+Usage:
+  trustctl install [coeval|ironside|stack] [options]
+  trustctl status [coeval|ironside|stack] [--root DIR]
+  trustctl doctor [coeval|ironside|stack] [--root DIR]
+  trustctl update --check [coeval|ironside|stack] [--root DIR]
+  trustctl update <coeval|ironside> --version X.Y.Z --backup-confirmed [--root DIR]
+  trustctl logs <coeval|ironside> [--root DIR] [--follow]
+  trustctl version
+
+Install options:
+  --root DIR                 Installation directory (default: ./ai-trust-stack)
+  --coeval-version X.Y.Z     Exact Coeval version; otherwise latest exact tag
+  --ironside-version X.Y.Z   Exact Ironside version; otherwise latest exact tag
+  --coeval-port PORT         Host port for Coeval (default: 8081)
+  --ironside-port PORT       Host port for Ironside (default: 8080)
+  --bind-address ADDRESS     Published listen address (default: 127.0.0.1)
+  --coeval-url URL           Browser URL (default: http://localhost:<port>)
+  --ironside-url URL         Browser URL (default: http://localhost:<port>)
+  --no-start                 Write and validate the installation without starting it
+  --allow-unsupported-os     Permit an untested non-Linux host
+
+Update safety:
+  --backup-confirmed         Confirms current off-host backups were created and verified
+  --preflight-only           Verify the bundle and pull images without changing active state
+
+Environment overrides used by tests and mirrors:
+  TRUSTCTL_ROOT, TRUSTCTL_ASSET_ROOT, TRUSTCTL_RAW_BASE, TRUSTCTL_API_BASE,
+  TRUSTCTL_LATEST_COEVAL_VERSION, TRUSTCTL_LATEST_IRONSIDE_VERSION
+EOF
+}
+
+script_dir() {
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
+}
+
+default_root() {
+  local own_dir
+  own_dir="$(script_dir)"
+  if [[ -f "${own_dir}/.trustctl/state.env" ]]; then
+    printf '%s\n' "$own_dir"
+  else
+    printf '%s/%s\n' "$PWD" "$DEFAULT_ROOT_NAME"
+  fi
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_version() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid semantic version: $1"
+}
+
+validate_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die "invalid port: $1"
+  ((1 <= 10#$1 && 10#$1 <= 65535)) || die "port outside 1-65535: $1"
+}
+
+validate_single_line() {
+  local label="$1"
+  local value="$2"
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "invalid ${label}"
+}
+
+validate_url() {
+  validate_single_line "URL" "$1"
+  [[ "$1" == http://* || "$1" == https://* ]] || die "URL must start with http:// or https://: $1"
+  [[ "$1" != *' '* ]] || die "URL must not contain spaces: $1"
+  [[ "$1" =~ ^https?://[^/[:space:]]+/?$ ]] \
+    || die "URL must be an origin without a path, query, or fragment: $1"
+}
+
+check_host_support() {
+  local allow_unsupported="${1:-0}"
+  local host_os
+  host_os="${TRUSTCTL_TEST_OS:-$(uname -s)}"
+  if [[ "$host_os" != "Linux" ]]; then
+    if [[ "$allow_unsupported" == "1" ]]; then
+      warn "${host_os} is not in the supported production host matrix; continuing by request"
+    else
+      die "the first supported host is Linux (use --allow-unsupported-os for local evaluation)"
+    fi
+  fi
+}
+
+check_docker() {
+  require_command docker
+  docker info >/dev/null 2>&1 || die "Docker Engine is not reachable"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required"
+  fi
+}
+
+verify_checksum() {
+  local file="$1"
+  local checksum_file="$2"
+  local expected actual
+  expected="$(awk 'NF { print $1; exit }' "$checksum_file")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid checksum file for $(basename "$file")"
+  actual="$(sha256_file "$file")"
+  actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  [[ "$actual" == "$expected" ]] || die "checksum mismatch for $(basename "$file")"
+}
+
+random_hex() {
+  local bytes="$1"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+  else
+    require_command od
+    od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+github_repo_for() {
+  case "$1" in
+    coeval) printf 'coeval\n' ;;
+    ironside) printf 'ironside\n' ;;
+    *) die "unknown product: $1" ;;
+  esac
+}
+
+product_label() {
+  case "$1" in
+    coeval) printf 'Coeval\n' ;;
+    ironside) printf 'Ironside\n' ;;
+    *) die "unknown product: $1" ;;
+  esac
+}
+
+latest_version() {
+  local product="$1"
+  local override_name override_value repo api_base response version
+  case "$product" in
+    coeval) override_name="TRUSTCTL_LATEST_COEVAL_VERSION" ;;
+    ironside) override_name="TRUSTCTL_LATEST_IRONSIDE_VERSION" ;;
+    *) die "unknown product: $product" ;;
+  esac
+  override_value="${!override_name:-}"
+  if [[ -n "$override_value" ]]; then
+    validate_version "$override_value"
+    printf '%s\n' "$override_value"
+    return
+  fi
+
+  require_command curl
+  repo="$(github_repo_for "$product")"
+  api_base="${TRUSTCTL_API_BASE:-$DEFAULT_API_BASE}"
+  response="$(curl -fsSL --retry 2 --connect-timeout 10 \
+    -H 'Accept: application/vnd.github+json' \
+    -H "User-Agent: trustctl/${TRUSTCTL_VERSION}" \
+    "${api_base}/${repo}/releases/latest")" || die "could not query the latest published ${product} release"
+  version="$(printf '%s\n' "$response" \
+    | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' \
+    | head -n 1 \
+    | sed -E 's/.*"v([0-9]+\.[0-9]+\.[0-9]+)"/\1/' \
+    || true)"
+  [[ -n "$version" ]] || die "latest published ${product} release is not an exact vX.Y.Z version"
+  validate_version "$version"
+  printf '%s\n' "$version"
+}
+
+fetch_asset() {
+  local product="$1"
+  local version="$2"
+  local asset="$3"
+  local destination="$4"
+  local repo raw_base source
+  if [[ -n "${TRUSTCTL_ASSET_ROOT:-}" ]]; then
+    source="${TRUSTCTL_ASSET_ROOT}/${product}/${version}/${asset}"
+    [[ -f "$source" ]] || die "local asset not found: $source"
+    cp "$source" "$destination"
+    return
+  fi
+
+  require_command curl
+  repo="$(github_repo_for "$product")"
+  raw_base="${TRUSTCTL_RAW_BASE:-$DEFAULT_RAW_BASE}"
+  curl -fsSL --retry 2 --connect-timeout 10 \
+    "${raw_base}/${repo}/v${version}/deploy/self-host/${asset}" \
+    -o "$destination" \
+    || die "${product} ${version} does not publish ${asset}; choose a release with the self-host bundle"
+}
+
+fetch_bundle() {
+  local product="$1"
+  local version="$2"
+  local destination_dir="$3"
+  mkdir -p "$destination_dir"
+  fetch_asset "$product" "$version" compose.yaml "${destination_dir}/compose.yaml"
+  fetch_asset "$product" "$version" compose.yaml.sha256 "${destination_dir}/compose.yaml.sha256"
+  verify_checksum "${destination_dir}/compose.yaml" "${destination_dir}/compose.yaml.sha256"
+}
+
+state_path() {
+  printf '%s/.trustctl/state.env\n' "$1"
+}
+
+state_value() {
+  local root="$1"
+  local key="$2"
+  local file
+  file="$(state_path "$root")"
+  [[ -f "$file" ]] || die "not a trustctl installation: $root"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+env_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || die "missing environment file: $file"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+product_dir() {
+  printf '%s/%s\n' "$1" "$2"
+}
+
+product_version_key() {
+  case "$1" in
+    coeval) printf 'COEVAL_VERSION\n' ;;
+    ironside) printf 'IRONSIDE_VERSION\n' ;;
+    *) die "unknown product: $1" ;;
+  esac
+}
+
+product_url_key() {
+  case "$1" in
+    coeval) printf 'COEVAL_PUBLIC_URL\n' ;;
+    ironside) printf 'IRONSIDE_PUBLIC_URL\n' ;;
+    *) die "unknown product: $1" ;;
+  esac
+}
+
+compose_project_key() {
+  case "$1" in
+    coeval) printf 'COEVAL_COMPOSE_PROJECT\n' ;;
+    ironside) printf 'IRONSIDE_COMPOSE_PROJECT\n' ;;
+    *) die "unknown product: $1" ;;
+  esac
+}
+
+compose_files() {
+  local dir="$1"
+  COMPOSE_FILE_ARGS=(-f "${dir}/compose.yaml")
+  if [[ -s "${dir}/compose.override.yaml" ]]; then
+    COMPOSE_FILE_ARGS+=(-f "${dir}/compose.override.yaml")
+  fi
+}
+
+compose_run() {
+  local root="$1"
+  local product="$2"
+  shift 2
+  local dir project
+  dir="$(product_dir "$root" "$product")"
+  project="$(env_value "${dir}/.env" "$(compose_project_key "$product")")"
+  compose_files "$dir"
+  docker compose --project-name "$project" --env-file "${dir}/.env" "${COMPOSE_FILE_ARGS[@]}" "$@"
+}
+
+compose_run_with() {
+  local product="$1"
+  local env_file="$2"
+  local compose_file="$3"
+  local override_file="$4"
+  shift 4
+  local project
+  project="$(env_value "$env_file" "$(compose_project_key "$product")")"
+  local args=(-f "$compose_file")
+  if [[ -s "$override_file" ]]; then
+    args+=(-f "$override_file")
+  fi
+  docker compose --project-name "$project" --env-file "$env_file" "${args[@]}" "$@"
+}
+
+managed_checksum_path() {
+  printf '%s/.trustctl/managed/%s-compose.sha256\n' "$1" "$2"
+}
+
+assert_managed_compose_unchanged() {
+  local root="$1"
+  local product="$2"
+  local compose checksum_file expected actual
+  compose="$(product_dir "$root" "$product")/compose.yaml"
+  checksum_file="$(managed_checksum_path "$root" "$product")"
+  [[ -f "$compose" && -f "$checksum_file" ]] || die "managed ${product} Compose state is incomplete"
+  expected="$(awk 'NF { print $1; exit }' "$checksum_file")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid managed checksum for ${product}"
+  actual="$(sha256_file "$compose")"
+  actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  [[ "$actual" == "$expected" ]] || die "${product}/compose.yaml was edited; move customizations to compose.override.yaml before updating"
+}
+
+write_checksum_record() {
+  local root="$1"
+  local product="$2"
+  local compose
+  compose="$(product_dir "$root" "$product")/compose.yaml"
+  printf '%s  compose.yaml\n' "$(sha256_file "$compose")" > "$(managed_checksum_path "$root" "$product")"
+}
+
+write_coeval_env() {
+  local file="$1" version="$2" suffix="$3" bind="$4" port="$5" public_url="$6"
+  umask 077
+  {
+    printf 'COEVAL_COMPOSE_PROJECT=trust-coeval-%s\n' "$suffix"
+    printf 'COEVAL_VERSION=%s\n' "$version"
+    printf 'COEVAL_BIND_ADDRESS=%s\n' "$bind"
+    printf 'COEVAL_PORT=%s\n' "$port"
+    printf 'COEVAL_PUBLIC_URL=%s\n' "$public_url"
+    printf 'COEVAL_POSTGRES_DB=coeval\n'
+    printf 'COEVAL_POSTGRES_PASSWORD=%s\n' "$(random_hex 24)"
+    printf 'COEVAL_AUTH_SECRET=%s\n' "$(random_hex 32)"
+    printf 'COEVAL_BOOTSTRAP_TOKEN=%s\n' "$(random_hex 32)"
+  } > "$file"
+  chmod 600 "$file"
+}
+
+write_ironside_env() {
+  local file="$1" version="$2" suffix="$3" bind="$4" port="$5" public_url="$6"
+  local insecure="true"
+  [[ "$public_url" == https://* ]] && insecure="false"
+  umask 077
+  {
+    printf 'IRONSIDE_COMPOSE_PROJECT=trust-ironside-%s\n' "$suffix"
+    printf 'IRONSIDE_VERSION=%s\n' "$version"
+    printf 'IRONSIDE_BIND_ADDRESS=%s\n' "$bind"
+    printf 'IRONSIDE_PORT=%s\n' "$port"
+    printf 'IRONSIDE_PUBLIC_URL=%s\n' "$public_url"
+    printf 'IRONSIDE_AUTH_INSECURE_COOKIES=%s\n' "$insecure"
+    printf 'IRONSIDE_POSTGRES_DB=ironside\n'
+    printf 'IRONSIDE_POSTGRES_PASSWORD=%s\n' "$(random_hex 24)"
+    printf 'IRONSIDE_CLICKHOUSE_DB=ironside\n'
+    printf 'IRONSIDE_CLICKHOUSE_PASSWORD=%s\n' "$(random_hex 24)"
+    printf 'IRONSIDE_REDIS_PASSWORD=%s\n' "$(random_hex 24)"
+    printf 'IRONSIDE_MINIO_PASSWORD=%s\n' "$(random_hex 24)"
+    printf 'IRONSIDE_ENCRYPTION_SECRET=%s\n' "$(random_hex 32)"
+    printf 'IRONSIDE_METRICS_TOKEN=%s\n' "$(random_hex 32)"
+    printf 'IRONSIDE_S3_BUCKET=ironside-raw\n'
+    printf 'IRONSIDE_S3_REGION=us-east-1\n'
+  } > "$file"
+  chmod 600 "$file"
+}
+
+write_override() {
+  local file="$1"
+  cat > "$file" <<'EOF'
+# Operator-owned Compose additions and overrides belong here.
+# trustctl preserves this file across updates.
+services: {}
+EOF
+}
+
+write_state() {
+  local root="$1" mode="$2" coeval="$3" ironside="$4"
+  umask 077
+  {
+    printf 'TRUSTCTL_STATE_VERSION=1\n'
+    printf 'INSTALL_MODE=%s\n' "$mode"
+    printf 'COEVAL_INSTALLED=%s\n' "$coeval"
+    printf 'IRONSIDE_INSTALLED=%s\n' "$ironside"
+    printf 'CREATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$(state_path "$root")"
+  chmod 600 "$(state_path "$root")"
+}
+
+selected_products() {
+  case "$1" in
+    coeval) printf 'coeval\n' ;;
+    ironside) printf 'ironside\n' ;;
+    stack) printf 'ironside\ncoeval\n' ;;
+    *) die "expected coeval, ironside, or stack; got: $1" ;;
+  esac
+}
+
+installed_products() {
+  local root="$1"
+  local requested="$2"
+  local state_file product installed
+  state_file="$(state_path "$root")"
+  [[ -f "$state_file" ]] || die "not a trustctl installation: $root"
+  RESOLVED_PRODUCTS=()
+  local candidates=()
+  case "$requested" in
+    coeval) candidates=(coeval) ;;
+    ironside) candidates=(ironside) ;;
+    stack) candidates=(ironside coeval) ;;
+    *) die "expected coeval, ironside, or stack; got: $requested" ;;
+  esac
+  for product in "${candidates[@]}"; do
+    case "$product" in
+      coeval) installed="$(state_value "$root" COEVAL_INSTALLED)" ;;
+      ironside) installed="$(state_value "$root" IRONSIDE_INSTALLED)" ;;
+    esac
+    [[ "$installed" == "0" || "$installed" == "1" ]] \
+      || die "invalid ${product} installation state under $root"
+    if [[ "$installed" == "1" ]]; then
+      RESOLVED_PRODUCTS+=("$product")
+    elif [[ "$requested" != "stack" ]]; then
+      die "${product} is not installed under $root"
+    fi
+  done
+  ((${#RESOLVED_PRODUCTS[@]} > 0)) || die "no managed products are installed under $root"
+}
+
+wait_for_health() {
+  local root="$1" product="$2"
+  local dir url deadline
+  require_command curl
+  dir="$(product_dir "$root" "$product")"
+  url="$(env_value "${dir}/.env" "$(product_url_key "$product")")"
+  url="${url%/}/health"
+  deadline=$((SECONDS + ${TRUSTCTL_HEALTH_TIMEOUT_SECONDS:-300}))
+  info "Waiting for ${product} health at ${url}"
+  while ((SECONDS < deadline)); do
+    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+      ok "${product} is healthy"
+      return
+    fi
+    sleep 3
+  done
+  compose_run "$root" "$product" ps >&2 || true
+  warn "${product} did not become healthy; run ${root}/trustctl logs ${product} --root ${root}"
+  return 1
+}
+
+start_product() {
+  local root="$1" product="$2"
+  info "Pulling ${product} images"
+  compose_run "$root" "$product" pull
+  info "Starting ${product}"
+  compose_run "$root" "$product" up -d
+  wait_for_health "$root" "$product" || die "${product} startup did not pass its health check"
+}
+
+ensure_fresh_root() {
+  local root="$1"
+  if [[ -e "$root" ]]; then
+    if [[ -f "$(state_path "$root")" ]]; then
+      die "trustctl installation already exists: $root"
+    fi
+    if [[ -n "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      die "refusing to use non-empty unmanaged directory: $root"
+    fi
+  fi
+}
+
+cmd_install() {
+  local mode="stack"
+  if (($# > 0)) && [[ "$1" != --* ]]; then
+    mode="$1"
+    shift
+  fi
+
+  local root="${TRUSTCTL_ROOT:-$(default_root)}"
+  local coeval_version="" ironside_version=""
+  local coeval_port="8081" ironside_port="8080" bind_address="127.0.0.1"
+  local coeval_url="" ironside_url="" no_start=0 allow_unsupported=0
+  while (($#)); do
+    case "$1" in
+      --root) root="${2:?missing --root value}"; shift 2 ;;
+      --coeval-version) coeval_version="${2:?missing --coeval-version value}"; shift 2 ;;
+      --ironside-version) ironside_version="${2:?missing --ironside-version value}"; shift 2 ;;
+      --coeval-port) coeval_port="${2:?missing --coeval-port value}"; shift 2 ;;
+      --ironside-port) ironside_port="${2:?missing --ironside-port value}"; shift 2 ;;
+      --bind-address) bind_address="${2:?missing --bind-address value}"; shift 2 ;;
+      --coeval-url) coeval_url="${2:?missing --coeval-url value}"; shift 2 ;;
+      --ironside-url) ironside_url="${2:?missing --ironside-url value}"; shift 2 ;;
+      --no-start) no_start=1; shift ;;
+      --allow-unsupported-os) allow_unsupported=1; shift ;;
+      -h|--help) usage; return ;;
+      *) die "unknown install option: $1" ;;
+    esac
+  done
+
+  selected_products "$mode" >/dev/null
+  validate_port "$coeval_port"
+  validate_port "$ironside_port"
+  validate_single_line "bind address" "$bind_address"
+  [[ "$bind_address" != *' '* ]] || die "bind address must not contain spaces"
+  [[ "$mode" != "stack" || "$coeval_port" != "$ironside_port" ]] || die "Coeval and Ironside ports must differ"
+  coeval_url="${coeval_url:-http://localhost:${coeval_port}}"
+  ironside_url="${ironside_url:-http://localhost:${ironside_port}}"
+  validate_url "$coeval_url"
+  validate_url "$ironside_url"
+  check_host_support "$allow_unsupported"
+  check_docker
+  ensure_fresh_root "$root"
+
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$temp_dir"' EXIT
+
+  if [[ "$mode" == "coeval" || "$mode" == "stack" ]]; then
+    coeval_version="${coeval_version:-$(latest_version coeval)}"
+    validate_version "$coeval_version"
+    info "Fetching Coeval ${coeval_version} deployment bundle"
+    fetch_bundle coeval "$coeval_version" "${temp_dir}/coeval"
+  fi
+  if [[ "$mode" == "ironside" || "$mode" == "stack" ]]; then
+    ironside_version="${ironside_version:-$(latest_version ironside)}"
+    validate_version "$ironside_version"
+    info "Fetching Ironside ${ironside_version} deployment bundle"
+    fetch_bundle ironside "$ironside_version" "${temp_dir}/ironside"
+  fi
+
+  mkdir -p "$root/.trustctl/managed" "$root/.trustctl/history"
+  local suffix
+  suffix="$(random_hex 4)"
+  local coeval_installed=0 ironside_installed=0
+
+  if [[ "$mode" == "coeval" || "$mode" == "stack" ]]; then
+    mkdir -p "$root/coeval"
+    cp "${temp_dir}/coeval/compose.yaml" "$root/coeval/compose.yaml"
+    write_override "$root/coeval/compose.override.yaml"
+    write_coeval_env "$root/coeval/.env" "$coeval_version" "$suffix" "$bind_address" "$coeval_port" "$coeval_url"
+    coeval_installed=1
+  fi
+  if [[ "$mode" == "ironside" || "$mode" == "stack" ]]; then
+    mkdir -p "$root/ironside"
+    cp "${temp_dir}/ironside/compose.yaml" "$root/ironside/compose.yaml"
+    write_override "$root/ironside/compose.override.yaml"
+    write_ironside_env "$root/ironside/.env" "$ironside_version" "$suffix" "$bind_address" "$ironside_port" "$ironside_url"
+    ironside_installed=1
+  fi
+
+  write_state "$root" "$mode" "$coeval_installed" "$ironside_installed"
+  install -m 0755 "${BASH_SOURCE[0]}" "$root/trustctl"
+  ((coeval_installed)) && write_checksum_record "$root" coeval
+  ((ironside_installed)) && write_checksum_record "$root" ironside
+
+  local product
+  installed_products "$root" stack
+  for product in "${RESOLVED_PRODUCTS[@]}"; do
+    compose_run "$root" "$product" config --quiet
+    ok "${product} configuration is valid"
+  done
+
+  if ((no_start == 0)); then
+    for product in "${RESOLVED_PRODUCTS[@]}"; do
+      start_product "$root" "$product"
+    done
+  else
+    info "Installation written without starting containers"
+  fi
+
+  printf '\nInstallation directory: %s\n' "$root"
+  if ((ironside_installed)); then
+    printf 'Ironside: %s\n' "$ironside_url"
+    printf 'Owner setup: docker compose --project-name %q --env-file %q -f %q -f %q exec api node apps/api/dist/src/scripts/owner-setup.js\n' \
+      "$(env_value "$root/ironside/.env" IRONSIDE_COMPOSE_PROJECT)" "$root/ironside/.env" \
+      "$root/ironside/compose.yaml" "$root/ironside/compose.override.yaml"
+  fi
+  ((coeval_installed)) && printf 'Coeval: %s\n' "$coeval_url"
+  printf 'Secrets: preserve each product .env file in a separate recovery record.\n'
+  rm -rf -- "$temp_dir"
+  trap - EXIT
+}
+
+parse_root_and_target() {
+  local default_target="$1"
+  shift
+  PARSED_TARGET="$default_target"
+  PARSED_ROOT="${TRUSTCTL_ROOT:-$(default_root)}"
+  PARSED_FOLLOW=0
+  if (($# > 0)) && [[ "$1" != --* ]]; then
+    PARSED_TARGET="$1"
+    shift
+  fi
+  while (($#)); do
+    case "$1" in
+      --root) PARSED_ROOT="${2:?missing --root value}"; shift 2 ;;
+      --follow) PARSED_FOLLOW=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  selected_products "$PARSED_TARGET" >/dev/null
+}
+
+cmd_status() {
+  parse_root_and_target stack "$@"
+  local product dir version url
+  installed_products "$PARSED_ROOT" "$PARSED_TARGET"
+  for product in "${RESOLVED_PRODUCTS[@]}"; do
+    dir="$(product_dir "$PARSED_ROOT" "$product")"
+    version="$(env_value "$dir/.env" "$(product_version_key "$product")")"
+    url="$(env_value "$dir/.env" "$(product_url_key "$product")")"
+    printf '\n%s %s\n' "$(product_label "$product")" "$version"
+    compose_run "$PARSED_ROOT" "$product" ps
+    if curl -fsS --max-time 5 "${url%/}/health" >/dev/null 2>&1; then
+      ok "healthy at ${url}"
+    else
+      warn "health endpoint unavailable at ${url}"
+    fi
+  done
+}
+
+required_env_keys() {
+  case "$1" in
+    coeval)
+      printf '%s\n' COEVAL_VERSION COEVAL_COMPOSE_PROJECT COEVAL_PUBLIC_URL COEVAL_POSTGRES_PASSWORD COEVAL_AUTH_SECRET
+      ;;
+    ironside)
+      printf '%s\n' IRONSIDE_VERSION IRONSIDE_COMPOSE_PROJECT IRONSIDE_PUBLIC_URL IRONSIDE_POSTGRES_PASSWORD \
+        IRONSIDE_CLICKHOUSE_PASSWORD IRONSIDE_REDIS_PASSWORD IRONSIDE_MINIO_PASSWORD IRONSIDE_ENCRYPTION_SECRET IRONSIDE_METRICS_TOKEN
+      ;;
+  esac
+}
+
+doctor_product() {
+  local root="$1" product="$2"
+  local dir env_file key value version
+  dir="$(product_dir "$root" "$product")"
+  env_file="${dir}/.env"
+  [[ -f "$env_file" ]] || die "missing ${product}/.env"
+  assert_managed_compose_unchanged "$root" "$product"
+  while IFS= read -r key; do
+    value="$(env_value "$env_file" "$key")"
+    [[ -n "$value" ]] || die "${product}/.env is missing ${key}"
+  done < <(required_env_keys "$product")
+  version="$(env_value "$env_file" "$(product_version_key "$product")")"
+  validate_version "$version"
+  compose_run "$root" "$product" config --quiet
+  ok "${product}: managed bundle, required configuration, and Compose render are valid"
+
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    local mode
+    mode="$(stat -c '%a' "$env_file")"
+    if (((8#$mode & 077) != 0)); then
+      warn "${env_file} permissions are ${mode}; use chmod 600"
+    else
+      ok "${product}: secret file permissions are restricted"
+    fi
+  fi
+}
+
+cmd_doctor() {
+  parse_root_and_target stack "$@"
+  check_docker
+  ok "Docker Engine and Compose v2 are reachable"
+  local product
+  installed_products "$PARSED_ROOT" "$PARSED_TARGET"
+  for product in "${RESOLVED_PRODUCTS[@]}"; do
+    doctor_product "$PARSED_ROOT" "$product"
+  done
+}
+
+semver_compare() {
+  local left="$1" right="$2"
+  local left_major left_minor left_patch right_major right_minor right_patch
+  IFS=. read -r left_major left_minor left_patch <<< "$left"
+  IFS=. read -r right_major right_minor right_patch <<< "$right"
+  if ((10#$left_major != 10#$right_major)); then
+    ((10#$left_major > 10#$right_major)) && printf '1\n' || printf '%s\n' '-1'
+  elif ((10#$left_minor != 10#$right_minor)); then
+    ((10#$left_minor > 10#$right_minor)) && printf '1\n' || printf '%s\n' '-1'
+  elif ((10#$left_patch != 10#$right_patch)); then
+    ((10#$left_patch > 10#$right_patch)) && printf '1\n' || printf '%s\n' '-1'
+  else
+    printf '0\n'
+  fi
+}
+
+version_relation() {
+  local current="$1" latest="$2"
+  local comparison
+  comparison="$(semver_compare "$current" "$latest")"
+  case "$comparison" in
+    0) printf 'current\n' ;;
+    -1) printf 'update-available\n' ;;
+    1) printf 'ahead\n' ;;
+  esac
+}
+
+cmd_update_check() {
+  parse_root_and_target stack "$@"
+  local product dir current latest relation
+  installed_products "$PARSED_ROOT" "$PARSED_TARGET"
+  for product in "${RESOLVED_PRODUCTS[@]}"; do
+    dir="$(product_dir "$PARSED_ROOT" "$product")"
+    current="$(env_value "$dir/.env" "$(product_version_key "$product")")"
+    latest="$(latest_version "$product")"
+    relation="$(version_relation "$current" "$latest")"
+    case "$relation" in
+      current) printf '%s %s is current.\n' "$(product_label "$product")" "$current" ;;
+      update-available) printf '%s update available: %s -> %s\n' "$(product_label "$product")" "$current" "$latest" ;;
+      ahead) printf '%s %s is newer than the latest published exact tag %s.\n' "$(product_label "$product")" "$current" "$latest" ;;
+    esac
+  done
+}
+
+replace_env_value() {
+  local file="$1" key="$2" value="$3"
+  local temp
+  temp="${file}.tmp.$$"
+  awk -F= -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    $1 == key { print key "=" value; found = 1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$file" > "$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$file"
+}
+
+confirm_backup() {
+  local confirmed="$1"
+  ((confirmed == 1)) && return
+  if [[ -t 0 ]]; then
+    local answer
+    printf 'Type BACKUP to confirm current off-host backups exist and have been verified: '
+    read -r answer
+    [[ "$answer" == "BACKUP" ]] || die "update cancelled"
+  else
+    die "update requires --backup-confirmed in a non-interactive session"
+  fi
+}
+
+cmd_update_apply() {
+  local product="$1"
+  shift
+  [[ "$product" == "coeval" || "$product" == "ironside" ]] || die "apply updates one product at a time: coeval or ironside"
+  local root="${TRUSTCTL_ROOT:-$(default_root)}" target="" backup_confirmed=0 preflight_only=0
+  while (($#)); do
+    case "$1" in
+      --root) root="${2:?missing --root value}"; shift 2 ;;
+      --version) target="${2:?missing --version value}"; shift 2 ;;
+      --backup-confirmed) backup_confirmed=1; shift ;;
+      --preflight-only) preflight_only=1; shift ;;
+      *) die "unknown update option: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "explicit --version X.Y.Z is required"
+  validate_version "$target"
+  installed_products "$root" "$product"
+  check_docker
+
+  local dir env_file version_key current
+  dir="$(product_dir "$root" "$product")"
+  env_file="${dir}/.env"
+  version_key="$(product_version_key "$product")"
+  current="$(env_value "$env_file" "$version_key")"
+  if [[ "$current" == "$target" ]]; then
+    info "${product} is already at ${target}"
+    return
+  fi
+  if (( $(semver_compare "$target" "$current") < 0 )); then
+    die "refusing to downgrade ${product} from ${current} to ${target}; restore procedures are release-specific"
+  fi
+
+  local lock_dir
+  lock_dir="${root}/.trustctl/update.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "another trustctl update appears to be active under $root"
+  fi
+  printf '%s\n' "$$" > "${lock_dir}/pid"
+
+  local temp_dir=""
+  trap '[[ -z "$temp_dir" ]] || rm -rf -- "$temp_dir"; rm -f -- "$lock_dir/pid"; rmdir -- "$lock_dir" 2>/dev/null || true' EXIT
+  doctor_product "$root" "$product"
+
+  if ((preflight_only == 0)); then
+    confirm_backup "$backup_confirmed"
+  fi
+  printf '\nUpdate plan\n'
+  printf '  Product: %s\n' "$product"
+  printf '  Version: %s -> %s\n' "$current" "$target"
+  printf '  Release notes: https://github.com/luka-zivkovic/%s/releases/tag/v%s\n' "$(github_repo_for "$product")" "$target"
+  printf '  Rollback: not assumed safe after migrations; use a documented forward fix or restore.\n\n'
+
+  local temp_env history_dir timestamp
+  temp_dir="$(mktemp -d)"
+  fetch_bundle "$product" "$target" "$temp_dir"
+  temp_env="${temp_dir}/.env"
+  cp "$env_file" "$temp_env"
+  replace_env_value "$temp_env" "$version_key" "$target"
+
+  compose_run_with "$product" "$temp_env" "${temp_dir}/compose.yaml" "${dir}/compose.override.yaml" config --quiet
+  ok "target configuration renders with the existing instance settings"
+  info "Pulling target images before changing installed state"
+  compose_run_with "$product" "$temp_env" "${temp_dir}/compose.yaml" "${dir}/compose.override.yaml" pull
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  history_dir="${root}/.trustctl/history/${product}/${timestamp}-${current}-to-${target}-$(random_hex 3)"
+  mkdir -p "$history_dir"
+  cp "${dir}/compose.yaml" "${history_dir}/compose.yaml"
+  cp "${temp_dir}/compose.yaml" "${history_dir}/target-compose.yaml"
+  {
+    printf 'FROM_VERSION=%s\n' "$current"
+    printf 'TO_VERSION=%s\n' "$target"
+    printf 'STARTED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'OUTCOME=pending\n'
+  } > "${history_dir}/update.env"
+
+  if ((preflight_only)); then
+    replace_env_value "${history_dir}/update.env" OUTCOME preflighted
+    info "${product} ${target} passed preflight; active Compose, version, and containers are unchanged"
+    rm -rf -- "$temp_dir"
+    temp_dir=""
+    rm -f -- "${lock_dir}/pid"
+    rmdir -- "$lock_dir"
+    trap - EXIT
+    return
+  fi
+
+  cp "${temp_dir}/compose.yaml" "${dir}/compose.yaml"
+  replace_env_value "$env_file" "$version_key" "$target"
+  write_checksum_record "$root" "$product"
+
+  info "Applying ${product} ${target}"
+  if ! compose_run "$root" "$product" up -d; then
+    replace_env_value "${history_dir}/update.env" OUTCOME deploy-failed
+    die "deployment failed after target state was selected; automatic downgrade is disabled because migrations may have run"
+  fi
+  if ! wait_for_health "$root" "$product"; then
+    replace_env_value "${history_dir}/update.env" OUTCOME health-failed
+    die "target did not become healthy; automatic downgrade is disabled because migrations may have run"
+  fi
+  replace_env_value "${history_dir}/update.env" OUTCOME healthy
+  replace_env_value "${history_dir}/update.env" COMPLETED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ok "${product} updated to ${target}"
+  rm -rf -- "$temp_dir"
+  temp_dir=""
+  rm -f -- "${lock_dir}/pid"
+  rmdir -- "$lock_dir"
+  trap - EXIT
+}
+
+cmd_update() {
+  if (($# > 0)) && [[ "$1" == "--check" ]]; then
+    shift
+    cmd_update_check "$@"
+    return
+  fi
+  (($# > 0)) || die "update requires --check or a product"
+  local product="$1"
+  shift
+  cmd_update_apply "$product" "$@"
+}
+
+cmd_logs() {
+  parse_root_and_target "" "$@"
+  [[ "$PARSED_TARGET" == "coeval" || "$PARSED_TARGET" == "ironside" ]] || die "logs requires coeval or ironside"
+  installed_products "$PARSED_ROOT" "$PARSED_TARGET"
+  if ((PARSED_FOLLOW)); then
+    compose_run "$PARSED_ROOT" "$PARSED_TARGET" logs --follow
+  else
+    compose_run "$PARSED_ROOT" "$PARSED_TARGET" logs --tail 200
+  fi
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || { usage; exit 1; }
+  shift || true
+  case "$command" in
+    install) cmd_install "$@" ;;
+    status) cmd_status "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    update) cmd_update "$@" ;;
+    logs) cmd_logs "$@" ;;
+    version|--version) printf 'trustctl %s\n' "$TRUSTCTL_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"
