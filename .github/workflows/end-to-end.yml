@@ -1,0 +1,70 @@
+name: Public installer smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Run the public one-line installer
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/luka-zivkovic/trustctl/main/install.sh \
+            | sh -s -- install stack --root "$INSTALL_ROOT"
+
+      - name: Verify both managed applications
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
+        run: |
+          "$INSTALL_ROOT/trustctl" doctor --root "$INSTALL_ROOT"
+          "$INSTALL_ROOT/trustctl" status --root "$INSTALL_ROOT"
+          "$INSTALL_ROOT/trustctl" update --check --root "$INSTALL_ROOT"
+          curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null
+          curl -fsS --max-time 5 http://127.0.0.1:8081/health >/dev/null
+
+      - name: Exercise Ironside owner setup
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
+        run: |
+          project="$(sed -n 's/^IRONSIDE_COMPOSE_PROJECT=//p' "$INSTALL_ROOT/ironside/.env")"
+          docker compose --project-name "$project" \
+            --env-file "$INSTALL_ROOT/ironside/.env" \
+            -f "$INSTALL_ROOT/ironside/compose.yaml" \
+            -f "$INSTALL_ROOT/ironside/compose.override.yaml" \
+            exec -T api node apps/api/dist/src/scripts/owner-setup.js \
+            | grep -q 'ironside_setup_'
+
+      - name: Show container state
+        if: always()
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
+        run: |
+          if [[ -x "$INSTALL_ROOT/trustctl" ]]; then
+            "$INSTALL_ROOT/trustctl" status --root "$INSTALL_ROOT" || true
+          fi
+
+      - name: Remove disposable stacks and volumes
+        if: always()
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
+        run: |
+          for product in ironside coeval; do
+            env_file="$INSTALL_ROOT/$product/.env"
+            compose_file="$INSTALL_ROOT/$product/compose.yaml"
+            override_file="$INSTALL_ROOT/$product/compose.override.yaml"
+            [[ -f "$env_file" && -f "$compose_file" ]] || continue
+            if [[ "$product" == "ironside" ]]; then
+              project="$(sed -n 's/^IRONSIDE_COMPOSE_PROJECT=//p' "$env_file")"
+            else
+              project="$(sed -n 's/^COEVAL_COMPOSE_PROJECT=//p' "$env_file")"
+            fi
+            docker compose --project-name "$project" --env-file "$env_file" \
+              -f "$compose_file" -f "$override_file" \
+              down -v --remove-orphans || true
+          done
