@@ -54,7 +54,7 @@ jobs:
         env:
           INSTALL_ROOT: ${{ runner.temp }}/ai-trust-stack
         run: |
-          for product in ironside coeval; do
+          for product in ironside rubrist; do
             env_file="$INSTALL_ROOT/$product/.env"
             compose_file="$INSTALL_ROOT/$product/compose.yaml"
             override_file="$INSTALL_ROOT/$product/compose.override.yaml"
@@ -62,7 +62,7 @@ jobs:
             if [[ "$product" == "ironside" ]]; then
               project="$(sed -n 's/^IRONSIDE_COMPOSE_PROJECT=//p' "$env_file")"
             else
-              project="$(sed -n 's/^COEVAL_COMPOSE_PROJECT=//p' "$env_file")"
+              project="$(sed -n 's/^RUBRIST_COMPOSE_PROJECT=//p' "$env_file")"
             fi
             docker compose --project-name "$project" --env-file "$env_file" \
               -f "$compose_file" -f "$override_file" \

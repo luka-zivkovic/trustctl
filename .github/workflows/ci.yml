@@ -31,3 +31,11 @@ jobs:
       - name: Shellcheck
         if: runner.os == 'Linux'
         run: shellcheck bin/trustctl install.sh tests/test.sh
+
+      - name: Render the exact Rubrist release bundle
+        if: runner.os == 'Linux'
+        run: >-
+          ./bin/trustctl install rubrist
+          --rubrist-version 0.3.0
+          --root "$RUNNER_TEMP/rubrist-contract"
+          --no-start
