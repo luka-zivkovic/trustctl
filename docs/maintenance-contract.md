@@ -64,7 +64,7 @@ The required data differs by product:
 ## Compatibility boundary
 
 Rubrist and Ironside have independent versions. A combined installation does
-not imply that matching version numbers are required. v0.1 applies updates one
+not imply that matching version numbers are required. v0.2 applies updates one
 product at a time and points the operator to each release note. A future stack
 manifest may name a tested pair, but trustctl must not invent compatibility in
 its absence.

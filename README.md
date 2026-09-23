@@ -4,11 +4,12 @@
 Rubrist and Ironside. It is deployment tooling, not part of either product's
 runtime or authorization model.
 
-Status: **Rubrist rename support prepared** for new single-host installations.
+Status: **Rubrist rename support** for new single-host installations.
 This CLI requires Rubrist v0.3.0 or newer and Ironside v0.2.0 or newer.
-Publish the renamed Rubrist images and run the public installer smoke workflow
-before declaring this combination supported. Default installation selects only
-published releases and rejects the older Coeval v0.2.x bundle.
+Default installation selects only published releases and rejects the older
+Coeval v0.2.x bundle. Product release workflows build and boot the exact images;
+the public installer smoke workflow checks the combined installation after
+publication. Re-run that workflow whenever a product release changes.
 
 Coeval installations use a different database baseline and environment prefix.
 Keep their saved trustctl 0.1.0 for maintenance; install Rubrist in a fresh root
