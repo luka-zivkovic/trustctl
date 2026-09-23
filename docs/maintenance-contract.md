@@ -15,7 +15,7 @@ the product's public health endpoint as the final runtime signal.
 An installation records:
 
 - state format version;
-- whether Coeval, Ironside, or both were installed;
+- whether Rubrist, Ironside, or both were installed;
 - independent Compose project names;
 - exact application versions in product `.env` files;
 - checksums of the release-owned Compose files; and
@@ -56,14 +56,14 @@ honestly report that an installation is recoverable.
 
 The required data differs by product:
 
-- Coeval: PostgreSQL plus `COEVAL_AUTH_SECRET`.
+- Rubrist: PostgreSQL plus `RUBRIST_AUTH_SECRET`.
 - Ironside: PostgreSQL, ClickHouse, object storage, and
   `IRONSIDE_ENCRYPTION_SECRET`. Redis is recoverable queue/cache state when the
   durable object-storage intent log is intact.
 
 ## Compatibility boundary
 
-Coeval and Ironside have independent versions. A combined installation does
+Rubrist and Ironside have independent versions. A combined installation does
 not imply that matching version numbers are required. v0.1 applies updates one
 product at a time and points the operator to each release note. A future stack
 manifest may name a tested pair, but trustctl must not invent compatibility in

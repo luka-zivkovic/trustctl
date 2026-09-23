@@ -1,13 +1,19 @@
 # trustctl
 
 `trustctl` is the optional single-host installer and maintenance CLI for
-Coeval and Ironside. It is deployment tooling, not part of either product's
+Rubrist and Ironside. It is deployment tooling, not part of either product's
 runtime or authorization model.
 
-Status: **supported initial release** for new single-host installations.
-Coeval v0.2.0 and Ironside v0.2.0 publish versioned self-host bundles, all five
-application images allow anonymous pulls, and the exact public installer
-command has passed the clean-runner smoke workflow.
+Status: **Rubrist rename support prepared** for new single-host installations.
+This CLI requires Rubrist v0.3.0 or newer and Ironside v0.2.0 or newer.
+Publish the renamed Rubrist images and run the public installer smoke workflow
+before declaring this combination supported. Default installation selects only
+published releases and rejects the older Coeval v0.2.x bundle.
+
+Coeval installations use a different database baseline and environment prefix.
+Keep their saved trustctl 0.1.0 for maintenance; install Rubrist in a fresh root
+with a clean database. This CLI refuses to adopt or upgrade Coeval state and
+does not delete its data.
 
 ## Support boundary
 
@@ -40,7 +46,7 @@ Install one product instead:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/luka-zivkovic/trustctl/main/install.sh \
-  | sh -s -- install coeval
+  | sh -s -- install rubrist
 ```
 
 The bootstrap downloads `bin/trustctl`, verifies its SHA-256 checksum, and
@@ -57,14 +63,14 @@ cannot make the ordinary pull-request suite flaky.
 
 The default installation directory is `./ai-trust-stack`. Use `--root` to
 choose another location. The installer creates independent Compose projects
-for Coeval and Ironside so their data, networks, and lifecycle remain
+for Rubrist and Ironside so their data, networks, and lifecycle remain
 separate.
 
 ## Install options
 
 ```sh
 trustctl install stack \
-  --coeval-version 0.2.0 \
+  --rubrist-version 0.3.0 \
   --ironside-version 0.2.0 \
   --root /srv/ai-trust-stack
 ```
@@ -75,14 +81,14 @@ installs, which prevents a tag from being selected while its images are still
 publishing. The CLI never selects a branch, container `latest`, or another
 floating reference.
 
-By default, Ironside listens on `127.0.0.1:8080` and Coeval on
+By default, Ironside listens on `127.0.0.1:8080` and Rubrist on
 `127.0.0.1:8081`. For an existing reverse proxy:
 
 ```sh
 trustctl install stack \
   --bind-address 127.0.0.1 \
   --ironside-url https://ironside.example.com \
-  --coeval-url https://coeval.example.com
+  --rubrist-url https://rubrist.example.com
 ```
 
 Use `--no-start` to generate and validate the installation without pulling or
@@ -146,7 +152,7 @@ compose.override.yaml    operator-owned and preserved across updates
 
 `trustctl` records the managed Compose checksum and refuses to update after a
 local edit. Move intentional changes into `compose.override.yaml`. Back up the
-`.env` files separately from database backups: Coeval's auth secret and
+`.env` files separately from database backups: Rubrist's auth secret and
 Ironside's encryption secret are required to recover encrypted credentials.
 
 ## Deliberate omissions in v0.1
